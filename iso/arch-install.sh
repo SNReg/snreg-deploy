@@ -52,9 +52,10 @@ arch-chroot /mnt sh -ec '
   fi
   grub-mkconfig -o /boot/grub/grub.cfg'
 
-cp -r "$src" /mnt/tmp/snreg
-arch-chroot /mnt sh /tmp/snreg/setup.sh /tmp/snreg
-rm -rf /mnt/tmp/snreg
+# Not /tmp: arch-chroot mounts a fresh tmpfs there.
+cp -r "$src" /mnt/var/tmp/snreg
+arch-chroot /mnt sh /var/tmp/snreg/setup.sh /var/tmp/snreg
+rm -rf /mnt/var/tmp/snreg
 # Last: arch-chroot gives the chroot the live system's resolver only while this is a plain file.
 ln -sf /run/systemd/resolve/stub-resolv.conf /mnt/etc/resolv.conf
 sync
