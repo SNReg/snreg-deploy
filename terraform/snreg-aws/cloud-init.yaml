@@ -1,0 +1,21 @@
+#cloud-config
+# The systemd path of spec §8 against RDS: server.toml is written before the package, which then
+# keeps it and creates no local database.
+package_update: true
+packages: [curl, postgresql-client]
+write_files:
+  - path: /etc/snreg/server.toml
+    permissions: "0640"
+    content: |
+      public_url = "${public_url}"
+      listen = "0.0.0.0:8443"
+      database_url = "${database_url}"
+      master_key_file = "/etc/snreg/master.key"
+      [tls]
+      cert = "/etc/snreg/tls.crt"
+      key = "/etc/snreg/tls.key"
+runcmd:
+  - [sh, -ec, 'curl -fsSL -o /root/snreg-server.deb "${package_url}"']
+  - [sh, -ec, 'DEBIAN_FRONTEND=noninteractive apt-get install -y /root/snreg-server.deb']
+  - [sh, -ec, 'umask 077; snreg-server init > /var/log/snreg-init.log 2>&1']
+  - [systemctl, enable, --now, snreg-server]

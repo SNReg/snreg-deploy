@@ -1,0 +1,80 @@
+# Nightly end to end (spec §9 P7): DM-1 for every distro, plus Compose, Helm on kind, Ansible
+# and the systemd path. These build from the private server, core, web and agent repos, which
+# needs the SNREG_READ_TOKEN secret (read-only contents access to those repos) and the repo
+# variable SNREG_E2E=true; until both are set the jobs are skipped.
+name: e2e
+on:
+  schedule: [{ cron: "17 2 * * *" }]
+  workflow_dispatch:
+
+jobs:
+  artifacts:
+    runs-on: ubuntu-latest
+    if: vars.SNREG_E2E == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: snreg-deploy }
+      - name: sibling repos
+        env: { GH_TOKEN: "${{ secrets.SNREG_READ_TOKEN }}" }
+        run: for r in core server web agent; do gh repo clone "SNReg/snreg-$r" "snreg-$r" -- -q --depth 1; done
+      - name: server image, .deb, binary; agent packages
+        run: |
+          docker build -q --build-context core=snreg-core --build-context web=snreg-web -t snreg-server:ci snreg-server
+          docker save snreg-server:ci | gzip > image.tar.gz
+          snreg-server/packaging/build.sh
+          docker build -q --build-context core=snreg-core --build-context web=snreg-web --target bin --output bin snreg-server
+          snreg-agent/packaging/build.sh deb rpm arch
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifacts
+          retention-days: 3
+          path: |
+            image.tar.gz
+            bin/snreg-server
+            snreg-server/packaging/dist/
+            snreg-agent/packaging/dist/
+
+  dm1:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        distro: [ubuntu-24.04, debian-12, fedora-41, rhel-9, arch]
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: snreg-deploy }
+      - uses: actions/download-artifact@v4
+        with: { name: artifacts }
+      - name: KVM, QEMU, OVMF, xorriso, mtools
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          sudo apt-get update -qq && sudo apt-get install -y -qq qemu-system-x86 qemu-utils ovmf xorriso mtools >/dev/null
+          sudo modprobe wireguard
+      - name: DM-1 ${{ matrix.distro }}
+        run: |
+          chmod +x bin/snreg-server
+          SNREG_SERVER_BIN=$PWD/bin/snreg-server SNREG_PACKAGES=$PWD/snreg-agent/packaging/dist \
+            snreg-deploy/iso/test.sh ${{ matrix.distro }}
+
+  deploy-targets:
+    needs: artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: snreg-deploy }
+      - uses: actions/download-artifact@v4
+        with: { name: artifacts }
+      - run: docker load < image.tar.gz
+      - name: compose
+        run: WG=1 snreg-deploy/compose/test.sh snreg-server:ci
+      - name: systemd (.deb)
+        run: snreg-deploy/systemd/test.sh snreg-server/packaging/dist/snreg-server_*_amd64.deb
+      - name: ansible
+        run: snreg-deploy/ansible/test.sh snreg-server/packaging/dist/snreg-server_*_amd64.deb snreg-agent/packaging/dist/snreg-agent_*_amd64.deb
+      - uses: helm/kind-action@v1
+        with: { install_only: true }
+      - name: helm on kind
+        run: snreg-deploy/helm/test.sh snreg-server:ci

@@ -1,23 +1,42 @@
-# SNReg server + Postgres (spec §8). Usage: cp .env.example .env && docker compose up -d
+# SNReg server + Postgres (spec §8). Usage:
+#   cp .env.example .env            # then set POSTGRES_PASSWORD and SNREG_PUBLIC_URL
+#   put tls.crt and tls.key in ./snreg/
+#   docker compose up -d
+#   docker compose logs init        # the first admin's password, shown once
 services:
+  # One-shot: master key (in ./snreg), migrations, first admin. Safe to run on every `up`.
+  init:
+    image: &image ${SNREG_IMAGE:-ghcr.io/snreg/snreg-server:${SNREG_VERSION:-0.1.0}}
+    command: [init]
+    network_mode: host
+    volumes: &etc ["./snreg:/etc/snreg"]
+    environment: &env
+      SNREG_LISTEN: 0.0.0.0:${SNREG_PORT:-8443}
+      SNREG_PUBLIC_URL: ${SNREG_PUBLIC_URL:?set SNREG_PUBLIC_URL in .env, e.g. https://snreg.example.org:8443}
+      SNREG_DATABASE_URL: postgres://snreg:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@127.0.0.1:${POSTGRES_PORT:-5432}/snreg
+      SNREG_TLS_CERT: /etc/snreg/tls.crt
+      SNREG_TLS_KEY: /etc/snreg/tls.key
+      SNREG_WG_ENABLED: ${SNREG_WG_ENABLED:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+
   server:
-    image: ghcr.io/snreg/snreg-server:${SNREG_VERSION:-0.1.0}
+    image: *image
     # Host networking + NET_ADMIN: the server manages the kernel WireGuard interface snreg0.
     network_mode: host
     cap_add: [NET_ADMIN]
     # Userspace WireGuard fallback when the host kernel has none.
     devices: ["/dev/net/tun"]
-    # master.key, tls.crt, tls.key. First run: docker compose run --rm server init
-    volumes: ["./snreg:/etc/snreg"]
-    environment:
-      SNREG_LISTEN: 0.0.0.0:8443
-      SNREG_PUBLIC_URL: ${SNREG_PUBLIC_URL:?set SNREG_PUBLIC_URL in .env, e.g. https://snreg.example.org:8443}
-      SNREG_DATABASE_URL: postgres://snreg:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@127.0.0.1:5432/snreg
-      SNREG_TLS_CERT: /etc/snreg/tls.crt
-      SNREG_TLS_KEY: /etc/snreg/tls.key
+    volumes: *etc
+    environment: *env
     depends_on:
-      db:
-        condition: service_healthy
+      init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/${SNREG_PORT:-8443}"]
+      interval: 5s
+      retries: 12
     restart: unless-stopped
 
   db:
@@ -26,7 +45,7 @@ services:
       POSTGRES_USER: snreg
       POSTGRES_DB: snreg
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
-    ports: ["127.0.0.1:5432:5432"]
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
     volumes: [db:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "snreg"]

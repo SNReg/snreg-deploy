@@ -1,0 +1,78 @@
+{{- $secret := required "existingSecret is required" .Values.existingSecret -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}
+  labels: &labels
+    app.kubernetes.io/name: snreg
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  # One WireGuard hub per instance: never run two pods at once.
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: *labels
+  template:
+    metadata:
+      labels: *labels
+    spec:
+      initContainers:
+        # Migrations and the first admin (its password is in this container's log, once).
+        - name: init
+          image: &image "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [init]
+          env: &env
+            - name: SNREG_PUBLIC_URL
+              value: {{ required "publicUrl is required" .Values.publicUrl | quote }}
+            - name: SNREG_LISTEN
+              value: "0.0.0.0:8443"
+            - name: SNREG_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: database-url } }
+            - name: SNREG_MASTER_KEY
+              valueFrom: { secretKeyRef: { name: {{ $secret }}, key: master-key } }
+            - name: SNREG_TLS_CERT
+              value: /etc/snreg/tls/tls.crt
+            - name: SNREG_TLS_KEY
+              value: /etc/snreg/tls/tls.key
+            - name: SNREG_WG_ENABLED
+              value: {{ .Values.wireguard.enabled | quote }}
+            - name: SNREG_WG_LISTEN_PORT
+              value: {{ .Values.wireguard.port | quote }}
+            {{- with .Values.wireguard.endpoint }}
+            - name: SNREG_WG_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+          volumeMounts: &mounts
+            - { name: tls, mountPath: /etc/snreg/tls, readOnly: true }
+      containers:
+        - name: server
+          image: *image
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [serve]
+          env: *env
+          volumeMounts: *mounts
+          ports:
+            - { name: https, containerPort: 8443, protocol: TCP }
+            - { name: wireguard, containerPort: {{ .Values.wireguard.port }}, protocol: UDP }
+          securityContext:
+            # Kernel WireGuard in the pod's network namespace; nothing else is added.
+            capabilities: { drop: [ALL], add: [NET_ADMIN] }
+            allowPrivilegeEscalation: false
+          readinessProbe: &probe
+            httpGet: { path: /api/v1/health, port: https, scheme: HTTPS }
+            periodSeconds: 5
+          livenessProbe:
+            <<: *probe
+            periodSeconds: 20
+            failureThreshold: 6
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tls
+          secret: { secretName: {{ required "tlsSecret is required" .Values.tlsSecret }}, defaultMode: 0400 }
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
