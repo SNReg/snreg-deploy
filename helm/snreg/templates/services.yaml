@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  type: {{ .Values.https.service.type }}
+  selector: { app.kubernetes.io/name: snreg, app.kubernetes.io/instance: {{ .Release.Name }} }
+  ports:
+    - { name: https, port: {{ .Values.https.service.port }}, targetPort: https, protocol: TCP }
+{{- if .Values.wireguard.enabled }}
+---
+# Separate Service: many cloud load balancers can't mix TCP and UDP on one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-wireguard
+spec:
+  type: {{ .Values.wireguard.service.type }}
+  selector: { app.kubernetes.io/name: snreg, app.kubernetes.io/instance: {{ .Release.Name }} }
+  ports:
+    - { name: wireguard, port: {{ .Values.wireguard.port }}, targetPort: wireguard, protocol: UDP }
+{{- end }}

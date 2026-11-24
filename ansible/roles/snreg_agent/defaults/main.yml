@@ -1,0 +1,9 @@
+# Agent packages on the controller (snreg-agent/packaging/dist) in the host's format: the agent
+# and, for telemetry, the kmod package (leave it out together with snreg_agent_kmod: false).
+snreg_agent_packages: []
+# Enrollment (spec §5.1). The token is a secret: keep it in Ansible Vault.
+snreg_server_url: ""
+snreg_server_cert_sha256: ""
+snreg_enrollment_token: ""
+# Kernel headers and dkms for the telemetry module. Without it the device reports `degraded`.
+snreg_agent_kmod: true

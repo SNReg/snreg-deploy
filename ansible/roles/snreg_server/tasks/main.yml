@@ -1,0 +1,52 @@
+# The systemd path of spec §8: package (+ local PostgreSQL), `snreg-server init`, enable --now.
+- name: Package lists
+  ansible.builtin.apt: { update_cache: true, cache_valid_time: 3600 }
+  when: ansible_pkg_mgr == 'apt'
+
+- name: PostgreSQL
+  ansible.builtin.package:
+    name: "{{ 'postgresql-server' if ansible_os_family == 'RedHat' else 'postgresql' }}"
+  when: snreg_server_postgresql
+
+- name: PostgreSQL cluster (RHEL family creates none on install)
+  ansible.builtin.command: postgresql-setup --initdb
+  args: { creates: /var/lib/pgsql/data/PG_VERSION }
+  when: snreg_server_postgresql and ansible_os_family == 'RedHat'
+
+- name: PostgreSQL running
+  ansible.builtin.service: { name: postgresql, state: started, enabled: true }
+  when: snreg_server_postgresql
+
+- name: Copy the server package
+  ansible.builtin.copy:
+    src: "{{ snreg_server_package }}"
+    dest: "/root/{{ snreg_server_package | basename }}"
+    mode: "0600"
+
+- name: Install the server package
+  ansible.builtin.apt: { deb: "/root/{{ snreg_server_package | basename }}" }
+  when: ansible_pkg_mgr == 'apt'
+
+- name: Install the server package
+  ansible.builtin.dnf: { name: "/root/{{ snreg_server_package | basename }}", disable_gpg_check: true }
+  when: ansible_pkg_mgr == 'dnf'
+
+- name: snreg-server init (master key, migrations, first admin)
+  ansible.builtin.command: snreg-server init
+  args: { creates: /etc/snreg/master.key }
+  register: snreg_init
+
+- name: The first admin's password (shown once; change it after logging in)
+  ansible.builtin.debug:
+    msg: "{{ snreg_init.stdout_lines | select('search', 'password') | list }}"
+  when: snreg_init is changed
+
+- name: snreg-server running
+  ansible.builtin.systemd_service: { name: snreg-server, state: started, enabled: true }
+
+- name: Wait for the API
+  ansible.builtin.uri: { url: "https://127.0.0.1:8443/api/v1/health", validate_certs: false }
+  register: snreg_health
+  until: snreg_health.status == 200
+  retries: 30
+  delay: 2

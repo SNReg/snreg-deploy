@@ -1,0 +1,8 @@
+# Example: ansible-playbook -i inventory site.yml -e @secrets.yml (vault the enrollment token)
+- hosts: snreg_server
+  become: true
+  roles: [snreg_server]
+
+- hosts: snreg_agents
+  become: true
+  roles: [snreg_agent]

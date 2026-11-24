@@ -8,8 +8,11 @@ Wants=network-online.target
 Type=exec
 User=snreg
 Group=snreg
-ExecStart=/usr/bin/snreg-server
+ExecStart=/usr/bin/snreg-server serve
 EnvironmentFile=-/etc/snreg/server.env
+# The master key stays root-only on disk; systemd hands the service a private copy (spec §7).
+LoadCredential=master.key:/etc/snreg/master.key
+Environment=SNREG_MASTER_KEY_FILE=%d/master.key
 # Kernel WireGuard (snreg0) needs CAP_NET_ADMIN; nothing else is granted (spec §8).
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN

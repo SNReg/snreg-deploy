@@ -1,0 +1,6 @@
+apiVersion: v2
+name: snreg
+description: SNReg server for the hosted tier (one instance per customer; Postgres is external)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -1,0 +1,10 @@
+#cloud-config
+# The systemd path of spec §8. PostgreSQL first, so the package creates its role and database.
+package_update: true
+packages: [postgresql, curl]
+runcmd:
+  - [sh, -ec, 'curl -fsSL -o /root/snreg-server.deb "${package_url}"']
+  - [sh, -ec, 'DEBIAN_FRONTEND=noninteractive apt-get install -y /root/snreg-server.deb']
+  - [sed, -i, 's|^public_url = .*|public_url = "${public_url}"|', /etc/snreg/server.toml]
+  - [sh, -ec, 'umask 077; snreg-server init > /var/log/snreg-init.log 2>&1']
+  - [systemctl, enable, --now, snreg-server]

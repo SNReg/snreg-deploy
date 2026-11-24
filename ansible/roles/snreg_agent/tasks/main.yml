@@ -1,0 +1,34 @@
+# For fleets that aren't imaged from the zero-touch ISO (spec §8): packages, enroll.toml, enroll.
+- name: Package lists
+  ansible.builtin.apt: { update_cache: true, cache_valid_time: 3600 }
+  when: ansible_pkg_mgr == 'apt'
+
+- name: dkms and kernel headers for the telemetry module
+  ansible.builtin.package:
+    name: "{{ ['dkms', snreg_headers[ansible_os_family] | default('linux-headers-' + ansible_kernel)] }}"
+  vars:
+    snreg_headers:
+      RedHat: "kernel-devel-{{ ansible_kernel }}"
+      Archlinux: linux-headers
+  when: snreg_agent_kmod
+
+- name: Copy the agent packages
+  ansible.builtin.copy: { src: "{{ item }}", dest: "/root/{{ item | basename }}", mode: "0600" }
+  loop: "{{ snreg_agent_packages }}"
+
+- name: Install the agent packages
+  ansible.builtin.command: >-
+    {{ {'apt': 'apt-get install -y', 'dnf': 'dnf install -y', 'pacman': 'pacman -U --noconfirm'}[ansible_pkg_mgr] }}
+    {{ snreg_agent_packages | map('basename') | map('regex_replace', '^', '/root/') | join(' ') }}
+  args: { creates: /usr/lib/snreg/configure.sh }
+  environment: { DEBIAN_FRONTEND: noninteractive }
+
+- name: enroll.toml
+  ansible.builtin.template: { src: enroll.toml.j2, dest: /etc/snreg/enroll.toml, mode: "0600" }
+  no_log: true
+
+- name: Enroll (runs once; snreg-enroll.service skips enrolled devices)
+  ansible.builtin.systemd_service: { name: snreg-enroll, state: started, enabled: true }
+
+- name: snreg-agentd running
+  ansible.builtin.systemd_service: { name: snreg-agentd, state: started, enabled: true }

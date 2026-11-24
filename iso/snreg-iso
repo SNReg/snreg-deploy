@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Zero-touch installer ISO (spec §6.2): takes a stock installer ISO and adds the agent packages,
+# /etc/snreg/enroll.toml and an unattended install config, then makes the boot menu start the
+# unattended install. Bash on top of xorriso and mtools; needs no root.
+#
+#   snreg-iso build --distro <ubuntu-24.04|debian-12|fedora-41|rhel-9|arch> --in <iso> \
+#     --server <url> --cert-sha256 <pin> --token <tok> --out <iso> \
+#     [--packages <dir>] [--admin-password-hash <crypt hash>] [--mok-password <pw>]
+#
+# --packages: the agent's packaging/dist (default ../../snreg-agent/packaging/dist).
+# --admin-password-hash: the local break-glass account (root; `snreg-admin` on Ubuntu). By default
+#   it gets a random password nobody knows, so only SNReg directory logins work.
+# --mok-password: queue the DKMS signing key for Secure Boot; MokManager asks for it once (ADR 0010).
+#
+# The output carries an enrollment token: it is written mode 0600. Treat it as a secret.
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+
+die() { echo "snreg-iso: $*" >&2; exit 1; }
+usage() { sed -n '6,9p' "$0" >&2; exit 2; }
+
+[[ ${1:-} == build ]] || usage
+shift
+distro='' in='' server='' pin='' token='' out='' admin_hash='' mok=''
+packages=$here/../../snreg-agent/packaging/dist
+while (($#)); do
+  [[ $# -ge 2 ]] || usage
+  case $1 in
+    --distro) distro=$2 ;; --in) in=$2 ;; --server) server=$2 ;; --cert-sha256) pin=$2 ;;
+    --token) token=$2 ;; --out) out=$2 ;; --packages) packages=$2 ;;
+    --admin-password-hash) admin_hash=$2 ;; --mok-password) mok=$2 ;;
+    *) usage ;;
+  esac
+  shift 2
+done
+
+# These values land in TOML, YAML, kickstart and shell files: allow no quoting characters at all.
+[[ $distro =~ ^(ubuntu-24\.04|debian-12|fedora-41|rhel-9|arch)$ ]] || die "--distro must be ubuntu-24.04, debian-12, fedora-41, rhel-9 or arch"
+[[ -f $in ]] || die "--in: no such file: $in"
+[[ -n $out ]] || usage
+[[ $(realpath -m "$out") != $(realpath "$in") ]] || die "--out must differ from --in"
+url_re='^https://[][A-Za-z0-9.:-]+(/[A-Za-z0-9._~/-]*)?$'
+[[ $server =~ $url_re ]] || die "--server must be an https:// URL"
+pin=${pin,,}; pin=${pin//:/}
+[[ $pin =~ ^[0-9a-f]{64}$ ]] || die "--cert-sha256 must be the certificate's SHA-256 in hex"
+[[ $token =~ ^[A-Za-z0-9_-]{8,}$ ]] || die "--token doesn't look like an enrollment token"
+[[ -z $admin_hash || $admin_hash =~ ^\$[0-9a-z]+\$[./A-Za-z0-9$=]+$ ]] || die "--admin-password-hash must be a crypt(3) hash, e.g. from openssl passwd -6"
+[[ ! $mok =~ [[:cntrl:]] ]] || die "--mok-password can't contain control characters"
+for t in xorriso mcopy mdir openssl; do command -v $t >/dev/null || die "needs $t"; done
+# Nobody knows this password: the account exists but can't be logged in to.
+[[ -n $admin_hash ]] || admin_hash=$(openssl passwd -6 "$(openssl rand -base64 33)")
+
+umask 077
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+pay=$work/snreg
+mkdir -p "$pay"
+
+# ---- payload: /snreg on the ISO ----------------------------------------------
+pick() { # pick <glob>: exactly one package
+  # shellcheck disable=SC2206 # $1 is a glob on purpose
+  local m=("$packages"/$1)
+  [[ ${#m[@]} -eq 1 && -f ${m[0]} ]] || die "need exactly one $1 in $packages (run snreg-agent/packaging/build.sh)"
+  cp "${m[0]}" "$pay/"
+}
+case $distro in
+  ubuntu-24.04 | debian-12) pick 'snreg-agent_*_amd64.deb'; pick 'snreg-kmod-dkms_*_all.deb' ;;
+  fedora-41 | rhel-9) pick 'snreg-agent-*.x86_64.rpm'; pick 'snreg-kmod-dkms-*.noarch.rpm' ;;
+  arch) pick 'snreg-agent-*-x86_64.pkg.tar.zst'; pick 'snreg-kmod-dkms-*-any.pkg.tar.zst' ;;
+esac
+cp "$here/setup.sh" "$pay/setup.sh"
+printf 'server_url = "%s"\nserver_cert_sha256 = "%s"\ntoken = "%s"\n' "$server" "$pin" "$token" >"$pay/enroll.toml"
+[[ -z $mok ]] || printf '%s' "$mok" >"$pay/mok-password"
+
+maps=() # extra -map <file> <iso path>
+args=   # kernel arguments added to every installer boot entry
+case $distro in
+  ubuntu-24.04)
+    # Subiquity reads /autoinstall.yaml from the install media; `autoinstall` skips its confirmation.
+    args=autoinstall
+    cat >"$work/autoinstall.yaml" <<EOF
+autoinstall:
+  version: 1
+  identity: {hostname: snreg-device, username: snreg-admin, password: '$admin_hash'}
+  storage: {layout: {name: direct}}
+  ssh: {install-server: false}
+  late-commands:
+    - cp -r /cdrom/snreg /target/tmp/snreg
+    - curtin in-target -- sh /tmp/snreg/setup.sh /tmp/snreg
+    - rm -rf /target/tmp/snreg
+  shutdown: reboot
+EOF
+    maps+=("$work/autoinstall.yaml" /autoinstall.yaml)
+    ;;
+  debian-12)
+    args='auto=true priority=critical preseed/file=/cdrom/snreg/preseed.cfg'
+    cat >"$pay/preseed.cfg" <<EOF
+d-i debian-installer/locale string en_US.UTF-8
+d-i keyboard-configuration/xkb-keymap select us
+d-i netcfg/choose_interface select auto
+d-i netcfg/get_hostname string snreg-device
+d-i netcfg/get_domain string
+d-i netcfg/hostname string snreg-device
+d-i mirror/country string manual
+d-i mirror/http/hostname string deb.debian.org
+d-i mirror/http/directory string /debian
+d-i mirror/http/proxy string
+d-i passwd/root-login boolean true
+d-i passwd/make-user boolean false
+d-i passwd/root-password-crypted password $admin_hash
+d-i clock-setup/utc boolean true
+d-i time/zone string UTC
+d-i partman-auto/method string regular
+d-i partman-auto/choose_recipe select atomic
+d-i partman-efi/non_efi_system boolean true
+d-i partman-partitioning/confirm_write_new_label boolean true
+d-i partman/choose_partition select finish
+d-i partman/confirm boolean true
+d-i partman/confirm_nooverwrite boolean true
+d-i apt-setup/cdrom/set-first boolean false
+d-i apt-setup/disable-cdrom-entries boolean true
+tasksel tasksel/first multiselect standard
+popularity-contest popularity-contest/participate boolean false
+d-i grub-installer/only_debian boolean true
+d-i grub-installer/bootdev string default
+d-i finish-install/reboot_in_progress note
+d-i preseed/late_command string cp -r /cdrom/snreg /target/tmp/snreg; in-target sh /tmp/snreg/setup.sh /tmp/snreg; rm -rf /target/tmp/snreg
+EOF
+    ;;
+  fedora-41 | rhel-9)
+    # inst.ks is added next to the ISO's own inst.stage2=hd:LABEL=… (see patch_cfg).
+    cat >"$pay/ks.cfg" <<EOF
+text
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+network --bootproto=dhcp --activate --hostname=snreg-device
+rootpw --iscrypted $admin_hash
+zerombr
+clearpart --all --initlabel
+autopart
+bootloader
+reboot --eject
+%packages
+@core
+curl
+%end
+%post --nochroot
+cp -r /run/install/repo/snreg /mnt/sysimage/tmp/snreg
+%end
+%post --log=/root/snreg-setup.log
+sh /tmp/snreg/setup.sh /tmp/snreg
+rm -rf /tmp/snreg
+%end
+EOF
+    ;;
+  arch)
+    # The live ISO runs the script= file on tty1 (archiso's .automated_script.sh).
+    args='script=/run/archiso/bootmnt/snreg/install.sh'
+    sed "s|@ADMIN_HASH@|$admin_hash|" "$here/arch-install.sh" >"$pay/install.sh"
+    chmod 755 "$pay/install.sh"
+    ;;
+esac
+
+# ---- boot menus ----------------------------------------------------------------
+# One edit for every boot loader on these ISOs, keyed by which loader owns the file: kernel
+# arguments go on GRUB `linux`, syslinux `append` and systemd-boot `options` lines (before d-i's
+# `---`, which separates installer arguments from the installed system's), menus time out after
+# 5 s, and isolinux defaults to the install entry rather than "test media".
+patch_cfg() { # patch_cfg <file> <path on the ISO>; returns 1 when nothing changed
+  local f=$1 p=$2 before kw tmo
+  before=$(cat "$f")
+  if [[ $p == */loader/* ]]; then kw=options tmo=5
+  elif [[ $p == */grub* || $p == *grub.cfg ]]; then kw='linux|linuxefi' tmo=5
+  else kw=append tmo=50 # syslinux counts tenths of a second
+  fi
+  if [[ -n $args ]]; then
+    sed -E -i "/^[[:space:]]*($kw)[[:space:]]/I{
+      /^[[:space:]]*append[[:space:]]+(hd0|-pxe-|modules_alias)/Ib
+      / ---/{
+        s| ---| $args ---|
+        b
+      }
+      s|[[:space:]]*\$| $args|
+    }" "$f"
+  fi
+  [[ $distro =~ ^(fedora-41|rhel-9)$ ]] &&
+    sed -E -i 's#inst\.stage2=hd:LABEL=([^[:space:]]+)#& inst.ks=hd:LABEL=\1:/snreg/ks.cfg#' "$f"
+  sed -E -i -e "s/^([[:space:]]*set timeout=).*/\\1$tmo/" -e "s/^([[:space:]]*timeout)[[:space:]]+[0-9]+[[:space:]]*\$/\\1 $tmo/I" \
+    -e 's/^([[:space:]]*set default=).*/\1"0"/' "$f"
+  if grep -q '^[[:space:]]*menuentry' "$f" && ! grep -q 'set timeout=' "$f"; then sed -i '1i set timeout=5' "$f"; fi
+  if grep -qi '^[[:space:]]*menu default' "$f"; then
+    sed -E -i '/^[[:space:]]*menu default/Id' "$f"
+    sed -E -i '0,/^[[:space:]]*label[[:space:]]/I{/^[[:space:]]*label[[:space:]]/Ia\  menu default
+}' "$f"
+  fi
+  [[ $(cat "$f") != "$before" ]]
+}
+
+list_iso_cfgs() {
+  { xorriso -indev "$in" -find / -type f -name '*.cfg' 2>/dev/null
+    xorriso -indev "$in" -find /loader -type f -name '*.conf' 2>/dev/null || true; } | sed -n "s/^'\(.*\)'$/\1/p"
+}
+n=0
+while read -r p; do
+  [[ -n $p ]] || continue
+  n=$((n + 1))
+  f=$work/cfg$n
+  xorriso -osirrox on -indev "$in" -extract "$p" "$f" 2>/dev/null
+  chmod u+w "$f"
+  if patch_cfg "$f" "$p"; then maps+=("$f" "$p"); fi
+done < <(list_iso_cfgs)
+
+patch_fat() { # patch_fat <image>: boot menus inside a FAT (EFI) image; returns 1 when unchanged
+  local img=$1 p f changed=1
+  while read -r p; do
+    [[ $p =~ \.(cfg|conf)$ ]] || continue
+    n=$((n + 1))
+    f=$work/cfg$n
+    mcopy -n -i "$img" "$p" "$f"
+    if patch_cfg "$f" "$p"; then mcopy -o -i "$img" "$f" "$p"; changed=0; fi
+  done < <(mdir -i "$img" -/ -b ::/ 2>/dev/null | grep -i -E '\.(cfg|conf)$' || true)
+  return $changed
+}
+
+boot=(-boot_image any replay)
+# The UEFI El Torito image is either a file on the ISO (Debian, Fedora, RHEL) or a partition
+# appended after it (Ubuntu, Arch).
+efi_path=$(xorriso -indev "$in" -report_el_torito plain 2>/dev/null | awk '/El Torito img path/ && $6 == 2 {print $7}')
+if [[ -n $efi_path ]]; then
+  xorriso -osirrox on -indev "$in" -extract "$efi_path" "$work/efi.img" 2>/dev/null
+  chmod u+w "$work/efi.img"
+  if patch_fat "$work/efi.img"; then maps+=("$work/efi.img" "$efi_path"); fi
+else # ESP appended after the ISO (Ubuntu, Arch): copy it out, patch, append again
+  part=$(xorriso -indev "$in" -report_system_area as_mkisofs 2>/dev/null |
+    sed -n "s/^-append_partition \([0-9]\+\) 0x[eE][fF] --interval:[a-z_]*:\([0-9]\+\)d-\([0-9]\+\)d::.*/\1 \2 \3/p" | head -1)
+  if [[ -n $part ]]; then
+    read -r num start end <<<"$part"
+    dd if="$in" of="$work/esp.img" bs=512 skip="$start" count=$((end - start + 1)) status=none
+    if patch_fat "$work/esp.img"; then boot+=(-append_partition "$num" 0xef "$work/esp.img"); fi
+  fi
+fi
+
+# ---- write -----------------------------------------------------------------------
+xargs_map=()
+for ((i = 0; i < ${#maps[@]}; i += 2)); do xargs_map+=(-map "${maps[i]}" "${maps[i + 1]}"); done
+rm -f "$out"
+xorriso -indev "$in" -outdev "$out" "${boot[@]}" -map "$pay" /snreg "${xargs_map[@]}" \
+  -chown_r 0 /snreg -- -chgrp_r 0 /snreg -- -chmod_r go-rwx /snreg -- 2>"$work/xorriso.log" || { cat "$work/xorriso.log" >&2; die "xorriso failed"; }
+chmod 600 "$out"
+echo "wrote $out ($distro). It carries an enrollment token: keep it secret."

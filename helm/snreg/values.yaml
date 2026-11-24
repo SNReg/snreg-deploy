@@ -1,0 +1,33 @@
+image:
+  repository: ghcr.io/snreg/snreg-server
+  tag: ""            # defaults to the chart's appVersion
+  pullPolicy: IfNotPresent
+
+# Required. The URL users and agents reach, e.g. https://acme.snreg.example.org
+publicUrl: ""
+
+# Required. A Secret you create, holding:
+#   database-url  postgres://user:pass@host:5432/db (the external Postgres)
+#   master-key    openssl rand -base64 32 (back it up: it decrypts TOTP secrets and keys)
+existingSecret: ""
+
+# Required. A kubernetes.io/tls Secret with the server's certificate. Agents pin it, so a
+# renewal that changes the key needs a new pin in enrollment ISOs.
+tlsSecret: ""
+
+https:
+  service:
+    type: LoadBalancer
+    port: 443
+
+wireguard:
+  enabled: true
+  port: 51820
+  # The address agents dial: the LoadBalancer's IP or DNS name and port, e.g. 203.0.113.7:51820.
+  endpoint: ""
+  service:
+    type: LoadBalancer
+
+resources: {}
+nodeSelector: {}
+tolerations: []

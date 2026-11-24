@@ -5,8 +5,38 @@ on:
   pull_request:
 
 jobs:
-  validate:
+  static:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cp compose/.env.example compose/.env && docker compose -f compose/docker-compose.yml config -q
+      - name: shellcheck
+        run: shellcheck -S warning iso/snreg-iso iso/setup.sh iso/arch-install.sh iso/test.sh compose/test.sh helm/test.sh ansible/test.sh systemd/test.sh
+      - name: compose config
+        run: cp compose/.env.example compose/.env && docker compose -f compose/docker-compose.yml config -q
+      - uses: azure/setup-helm@v4
+        with: { version: v3.16.4 }
+      - name: helm lint
+        run: helm lint helm/snreg --set publicUrl=https://x,existingSecret=s,tlsSecret=t
+      - uses: hashicorp/setup-terraform@v3
+        with: { terraform_version: 1.9.8 }
+      - name: terraform fmt + validate
+        run: |
+          terraform fmt -check -recursive terraform
+          for m in terraform/snreg-*; do terraform -chdir="$m" init -backend=false -input=false >/dev/null && terraform -chdir="$m" validate; done
+      - name: ansible syntax
+        run: |
+          pipx install ansible-core >/dev/null
+          ANSIBLE_ROLES_PATH=ansible/roles ansible-playbook --syntax-check -i localhost, ansible/site.yml
+      - name: snreg-iso rejects bad input
+        run: |
+          set +e
+          printf x > /tmp/in.iso
+          ok() { "$@" >/dev/null 2>&1 && { echo "accepted: $*"; exit 1; }; true; }
+          pin=$(printf 'a%.0s' $(seq 64))
+          ok iso/snreg-iso build --distro ubuntu-24.04 --in /tmp/in.iso --server http://x --cert-sha256 "$pin" --token tok_12345678 --out /tmp/o.iso
+          ok iso/snreg-iso build --distro ubuntu-24.04 --in /tmp/in.iso --server 'https://a"b' --cert-sha256 "$pin" --token tok_12345678 --out /tmp/o.iso
+          ok iso/snreg-iso build --distro ubuntu-24.04 --in /tmp/in.iso --server https://x --cert-sha256 abc --token tok_12345678 --out /tmp/o.iso
+          ok iso/snreg-iso build --distro ubuntu-24.04 --in /tmp/in.iso --server https://x --cert-sha256 "$pin" --token 'a"b' --out /tmp/o.iso
+          ok iso/snreg-iso build --distro windows --in /tmp/in.iso --server https://x --cert-sha256 "$pin" --token tok_12345678 --out /tmp/o.iso
+          ok iso/snreg-iso build --distro ubuntu-24.04 --in /tmp/in.iso --server https://x --cert-sha256 "$pin" --token tok_12345678 --out /tmp/in.iso
+          echo "all rejected"

@@ -1,0 +1,4 @@
+# Path on the controller to snreg-server's .deb or .rpm (snreg-server/packaging/build.sh).
+snreg_server_package: ""
+# Install PostgreSQL on the same host; the package then creates its role and database.
+snreg_server_postgresql: true
